@@ -1,0 +1,223 @@
+import numpy as np
+import pandas as pd
+import random
+import networkx as nx
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from mpl_toolkits.mplot3d import Axes3D
+
+# Genetic Algorithm parameters
+population_size = 50
+generations = 100
+crossover_rate = 0.9
+mutation_rate = 0.01
+
+# Function to initialize the population
+def initialize_population(population_size, num_stations, num_ev):
+    return [random.choices(range(num_stations), k=num_ev) for _ in range(population_size)]
+
+# Function to evaluate the fitness of individuals in the population
+def calculate_fitness(chromosomes):
+    fitness_values_ga = []
+    for chromosome in chromosomes:
+        total_charging_time, total_travel_time, total_waiting_time = objective_function(chromosome)
+        fitness_values_ga.append(1 / (total_charging_time + total_travel_time + total_waiting_time))  # Invert for maximization
+    return fitness_values_ga
+
+# Function for tournament selection
+def tournament_selection(chromosomes, fitness_values_ga, tournament_size):
+    selected_parents = []
+    for _ in range(len(chromosomes)):
+        tournament_indices = random.sample(range(len(chromosomes)), tournament_size)
+        tournament_fitness = [fitness_values_ga[i] for i in tournament_indices]
+        selected_parents.append(chromosomes[tournament_indices[np.argmax(tournament_fitness)]])
+    return selected_parents
+
+# Function for crossover (two-point crossover)
+def crossover(parent1, parent2):
+    crossover_points = sorted(random.sample(range(len(parent1)), 2))
+    child = parent1[:crossover_points[0]] + parent2[crossover_points[0]:crossover_points[1]] + parent1[crossover_points[1]:]
+    return child
+
+# Function for mutation (randomly change one gene)
+def mutate(chromosome, mutation_rate, num_stations):
+    mutated_chromosome = chromosome.copy()
+    for i in range(len(chromosome)):
+        if random.random() < mutation_rate:
+            mutated_chromosome[i] = random.randint(0, num_stations - 1)
+    return mutated_chromosome
+
+# New Objective function to minimize (total charging time, total travel time, and total waiting time of EVs)
+def objective_function(charging_schedule):
+    total_charging_time, total_travel_time, total_waiting_time, _ = calculate_total_charging_time(charging_schedule)
+    return total_charging_time, total_travel_time, total_waiting_time
+
+def calculate_total_charging_time(charging_schedule):
+    charging_queues = [[] for _ in range(num_stations)]
+    total_charging_time = 0
+    data_records = []
+    total_travel_time = 0
+    total_waiting_time = 0
+
+    for ev_index, station_index in enumerate(charging_schedule):
+        ev_location_x, ev_location_y = ev_location[ev_index]
+        station_index = min(max(station_index, 0), num_stations - 1)
+        station_x, station_y = station_locations[station_index]
+
+        distance_to_station = nx.shortest_path_length(
+            G, source=(ev_location_x, ev_location_y), target=(station_x, station_y), weight='distance'
+        )
+
+        average_speed = np.mean([G[u][v]['speed'] for (u, v) in G.edges()])
+        travel_time = distance_to_station / average_speed
+
+        charging_queue = charging_queues[station_index]
+        current_charging_time = 0
+        charging_power = charging_rates[int(station_index)]
+
+        if charging_queue:
+            current_charging_time = max(charging_queue[-1][2], current_charging_time)
+            available_power = max_power_limits[int(station_index)] - sum(item[3] for item in charging_queue)
+            if available_power >= charging_power:
+                charging_time = (desired_soc[ev_index] - remaining_battery[ev_index]) / charging_power
+            else:
+                charging_time = 0
+        else:
+            charging_time = (desired_soc[ev_index] - remaining_battery[ev_index]) / charging_power
+
+        current_charging_time += charging_time
+        total_charging_time += current_charging_time
+        charging_queue.append((ev_index, distance_to_station, current_charging_time, charging_time))
+
+        # Collect data for DataFrame
+        data_records.append({
+            'EV Index': ev_index,
+            'Charging Time': charging_time,
+            'Remaining Battery': remaining_battery[ev_index],
+            'Desired SOC': desired_soc[ev_index],
+            'Charging Rate': charging_power,
+            'Waiting Time': current_charging_time - charging_time,
+            'Distance from Station': distance_to_station,
+            'Travel Time': travel_time,
+            'Station Index': station_index,
+            'Battery Capacity': battery_capacities[ev_index],
+        })
+
+    # Create a DataFrame
+    df = pd.DataFrame(data_records)
+
+    # Calculate total travel time and total waiting time
+    total_travel_time = df['Travel Time'].sum()
+    total_waiting_time = df['Waiting Time'].sum()
+
+    return total_charging_time, total_travel_time, total_waiting_time, df
+
+# Genetic Algorithm
+def genetic_algorithm(population_size, generations, crossover_rate, mutation_rate, num_stations, num_ev):
+    population = initialize_population(population_size, num_stations, num_ev)
+    fitness_history = []  # To store the fitness values over generations
+    pareto_set_ga = []  # To store non-dominated solutions
+    final_best_solution_ga = None  # To track the final best solution
+    final_best_objective = float('inf')  # Initialize final best objective value
+
+    for generation in range(generations):
+        fitness_values_ga = calculate_fitness(population)
+        fitness_history.append(1 / max(fitness_values_ga))  # Store the maximum fitness value of the generation
+
+        selected_parents = tournament_selection(population, fitness_values_ga, tournament_size=5)
+
+        next_generation = []
+
+        # Crossover and Mutation
+        for i in range(0, len(selected_parents), 2):
+            parent1 = selected_parents[i]
+            parent2 = selected_parents[i + 1]
+
+            if random.random() < crossover_rate:
+                child1 = crossover(parent1, parent2)
+                child2 = crossover(parent2, parent1)
+            else:
+                child1, child2 = parent1, parent2
+
+            child1 = mutate(child1, mutation_rate, num_stations)
+            child2 = mutate(child2, mutation_rate, num_stations)
+
+            next_generation.extend([child1, child2])
+
+        population = next_generation
+
+        # Calculate objective values for each solution in the population
+        objective_values = [objective_function(chromosome) for chromosome in population]
+
+        # Iterate through each solution to check for non-dominance and update Pareto set
+        for charging_time, waiting_time, traveling_time in objective_values:
+            if is_non_dominated(charging_time, waiting_time, traveling_time, pareto_set_ga):
+                pareto_set_ga.append((charging_time, waiting_time, traveling_time))
+
+                # Update final best solution if applicable
+                objective_sum = charging_time + waiting_time + traveling_time
+                if objective_sum < final_best_objective:
+                    final_best_solution_ga = (charging_time, waiting_time, traveling_time)
+                    final_best_objective = objective_sum
+
+    # Plot the fitness function over generations
+    plt.plot(range(generations), fitness_history, color='purple')
+    plt.xlabel('Generation')
+    plt.ylabel('Fitness')
+    plt.title('Fitness Function Over Generations')
+    plt.show()
+
+    # Plot the fitness function over generations
+    plt.plot(range(generations), fitness_history, color='purple', label='Fitness - GA')
+    plt.xlabel('Generation')
+    plt.ylabel('Fitness')
+    plt.title('Fitness Function Over Generations')
+    plt.show()
+
+    # Convert fitness history to a DataFrame
+    fitness_df = pd.DataFrame({'Generation': range(generations), 'Fitness': fitness_history})
+    # Save fitness history to a CSV file
+    fitness_df.to_csv('fitness_history_ga3.csv', index=False)
+
+    # Create DataFrame for best solution
+    best_solution_df = pd.DataFrame({
+        'Charging Time': [final_best_solution_ga[0]],
+        'Waiting Time': [final_best_solution_ga[1]],
+        'Traveling Time': [final_best_solution_ga[2]]
+    })
+
+    # Save best solution to CSV
+    best_solution_df.to_csv('best_solution_ga3.csv', index=False)
+
+    # Return the final best solution and its fitness
+    best_solution, best_fitness, results_df = evaluate_best_solution(population)
+    return best_solution, best_fitness, results_df
+
+def evaluate_best_solution(population):
+    final_fitness_values = calculate_fitness(population)
+    best_solution_index = np.argmax(final_fitness_values)
+    best_solution = population[best_solution_index]
+    total_charging_time, total_travel_time, _, results_df = calculate_total_charging_time(best_solution)
+    best_fitness = total_charging_time + total_travel_time
+
+    # Return the best solution and its fitness
+    return best_solution, best_fitness, results_df
+
+# Run the Genetic Algorithm
+best_solution = genetic_algorithm(population_size, generations, crossover_rate, mutation_rate, num_stations)
+
+# Print the results
+print("Best Charging Schedule (Station Assignments):", best_solution)
+print("Best Fitness (1 / Total Charging Time):", best_fitness)
+print("Total Charging Time for the Best Solution:", 1 / best_fitness)
+print("Total Charging Time:", sum(results_df['Charging Time']))
+print("Total Waiting Time:", sum(results_df['Waiting Time']))
+print("Total Travel Time:", sum(results_df['Travel Time']))
+print("Total Time:", sum(results_df['Charging Time'] +results_df['Waiting Time'] +results_df['Travel Time']))
+
+# Print the results DataFrame
+print("Results DataFrame:")
+print(results_df)
+
+# Save results DataFrame to a CSV file
+results_df.to_csv('optimized_results_ga22.csv', index=False)
